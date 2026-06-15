@@ -339,7 +339,7 @@ class BushfireDataset(Dataset):
         random.shuffle(self.indices)
 
         print(f"[Dataset] 共生成 {len(self.indices)} 个训练块"
-              f"（高密度正:{len(hi_pos)} 低密度正:{len(lo_sampled)}/{len(lo_pos)} 负:{n_neg}）")
+              f"（高密度正:{len(hi_pos)} 低密度正:{len(lo_pos)}/{len(lo_pos)} 负:{n_neg}）")
         pos_ratio = burned_px / (total_px + 1e-6)
         pos_weight = (1 - pos_ratio) / (pos_ratio + 1e-6)
         self.pos_weight = pos_weight
@@ -373,30 +373,80 @@ class BushfireDataset(Dataset):
         return inp_p, mask_p
 
 
-class DoubleConv(nn.Module):
+class ResDoubleConv(nn.Module):
+    """ResNet 风格的双卷积块，用残差连接增强特征提取与梯度传播。"""
+
     def __init__(self, in_ch, out_ch, dropout=0.0):
         super().__init__()
-        layers = [
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        ]
-        if dropout > 0:
-            layers.append(nn.Dropout2d(dropout))
-        self.net = nn.Sequential(*layers)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.shortcut = (
+            nn.Identity()
+            if in_ch == out_ch
+            else nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+        )
 
     def forward(self, x):
-        return self.net(x)
+        identity = self.shortcut(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.conv2(out))
+        out = self.relu(out + identity)
+        return out
+
+
+class ASPP(nn.Module):
+    """空洞卷积空间金字塔池化，在 bottleneck 聚合多尺度上下文。"""
+
+    def __init__(self, in_ch, out_ch, rates=(1, 6, 12, 18), dropout=0.1):
+        super().__init__()
+        branches = []
+        for rate in rates:
+            if rate == 1:
+                branches.append(nn.Sequential(
+                    nn.Conv2d(in_ch, out_ch, 1, bias=False),
+                    nn.BatchNorm2d(out_ch),
+                    nn.ReLU(inplace=True),
+                ))
+            else:
+                branches.append(nn.Sequential(
+                    nn.Conv2d(in_ch, out_ch, 3, padding=rate, dilation=rate, bias=False),
+                    nn.BatchNorm2d(out_ch),
+                    nn.ReLU(inplace=True),
+                ))
+        self.branches = nn.ModuleList(branches)
+        self.image_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.ReLU(inplace=True),
+        )
+        self.project = nn.Sequential(
+            nn.Conv2d(out_ch * (len(rates) + 1), out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+        )
+
+    def forward(self, x):
+        size = x.shape[2:]
+        feats = [branch(x) for branch in self.branches]
+        pooled = F.interpolate(self.image_pool(x), size=size, mode='bilinear', align_corners=False)
+        feats.append(pooled)
+        return self.project(torch.cat(feats, dim=1))
 
 
 class Down(nn.Module):
     def __init__(self, in_ch, out_ch, dropout=0.0):
         super().__init__()
         self.pool = nn.MaxPool2d(2)
-        self.conv = DoubleConv(in_ch, out_ch, dropout)
+        self.conv = ResDoubleConv(in_ch, out_ch, dropout)
 
     def forward(self, x):
         return self.conv(self.pool(x))
@@ -407,10 +457,10 @@ class Up(nn.Module):
         super().__init__()
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv = DoubleConv(in_ch, out_ch)
+            self.conv = ResDoubleConv(in_ch, out_ch)
         else:
             self.up = nn.ConvTranspose2d(in_ch // 2, in_ch // 2, 2, stride=2)
-            self.conv = DoubleConv(in_ch, out_ch)
+            self.conv = ResDoubleConv(in_ch, out_ch)
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
@@ -428,11 +478,12 @@ class UNet(nn.Module):
                  dropout: float = 0.2):
         super().__init__()
         f = base_features
-        self.inc = DoubleConv(in_channels, f)
+        self.inc = ResDoubleConv(in_channels, f)
         self.d1 = Down(f, f * 2, dropout)
         self.d2 = Down(f * 2, f * 4, dropout)
         self.d3 = Down(f * 4, f * 8, dropout)
         self.d4 = Down(f * 8, f * 16, dropout)
+        self.aspp = ASPP(f * 16, f * 16, dropout=dropout)
         self.u1 = Up(f * 16 + f * 8, f * 8, bilinear)
         self.u2 = Up(f * 8 + f * 4, f * 4, bilinear)
         self.u3 = Up(f * 4 + f * 2, f * 2, bilinear)
@@ -444,7 +495,7 @@ class UNet(nn.Module):
         x2 = self.d1(x1)
         x3 = self.d2(x2)
         x4 = self.d3(x3)
-        x5 = self.d4(x4)
+        x5 = self.aspp(self.d4(x4))
         x = self.u1(x5, x4)
         x = self.u2(x, x3)
         x = self.u3(x, x2)
@@ -476,9 +527,49 @@ class DiceLoss(nn.Module):
         return 1.0 - dice
 
 
+class BoundaryLoss(nn.Module):
+    """基于 Sobel/Laplacian 边缘响应的边界约束损失。"""
+
+    def __init__(self, operator='sobel', eps=1e-6):
+        super().__init__()
+        self.operator = operator.lower()
+        self.eps = eps
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        laplacian = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
+        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
+        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
+        self.register_buffer('laplacian', laplacian.view(1, 1, 3, 3))
+
+    def _edge_map(self, x):
+        x = x.unsqueeze(1) if x.dim() == 3 else x
+        if self.operator == 'laplacian':
+            edge = torch.abs(F.conv2d(x, self.laplacian, padding=1))
+        elif self.operator == 'sobel_laplacian':
+            gx = F.conv2d(x, self.sobel_x, padding=1)
+            gy = F.conv2d(x, self.sobel_y, padding=1)
+            sobel = torch.sqrt(gx.pow(2) + gy.pow(2) + self.eps)
+            lap = torch.abs(F.conv2d(x, self.laplacian, padding=1))
+            edge = 0.5 * (sobel + lap)
+        else:
+            gx = F.conv2d(x, self.sobel_x, padding=1)
+            gy = F.conv2d(x, self.sobel_y, padding=1)
+            edge = torch.sqrt(gx.pow(2) + gy.pow(2) + self.eps)
+        return edge / (edge.amax(dim=(2, 3), keepdim=True).clamp_min(self.eps))
+
+    def forward(self, logits, targets):
+        probs = torch.softmax(logits, dim=1)[:, 1, :, :]
+        targets = targets.float()
+        pred_edges = self._edge_map(probs)
+        target_edges = self._edge_map(targets)
+        return F.l1_loss(pred_edges, target_edges)
+
+
 class CombinedLoss(nn.Module):
-    def __init__(self, ce_weight=0.6,
-                 dice_weight=0.4,
+    def __init__(self, ce_weight=0.55,
+                 dice_weight=0.35,
+                 boundary_weight=0.10,
+                 boundary_operator='sobel_laplacian',
                  pos_weight=None):
         super().__init__()
         if pos_weight is not None:
@@ -487,13 +578,16 @@ class CombinedLoss(nn.Module):
             weight = None
         self.ce = nn.CrossEntropyLoss(weight=weight)
         self.dice = DiceLoss()
+        self.boundary = BoundaryLoss(operator=boundary_operator)
         self.w_ce = ce_weight
         self.w_dice = dice_weight
+        self.w_boundary = boundary_weight
 
     def forward(self, logits, targets):
         return (
                 self.w_ce * self.ce(logits, targets)
                 + self.w_dice * self.dice(logits, targets)
+                + self.w_boundary * self.boundary(logits, targets)
         )
 
 
@@ -630,8 +724,10 @@ def run_training(args):
     train_pos_weight = getattr(train_ds, 'pos_weight', pos_weight)
     print(f"[Loss] 训练集实际正类权重：{train_pos_weight:.2f}（上限截断为 10.0）")
     criterion = CombinedLoss(
-        ce_weight=0.6,
-        dice_weight=0.4,
+        ce_weight=0.55,
+        dice_weight=0.35,
+        boundary_weight=0.10,
+        boundary_operator='sobel_laplacian',
         pos_weight=min(train_pos_weight, 10.0)
     ).to(device)
 
